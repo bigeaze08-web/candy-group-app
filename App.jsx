@@ -1,72 +1,321 @@
-import React, { useMemo, useRef, useState } from 'react';
-import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip } from 'recharts';
-const uid = () => Math.random().toString(36).slice(2,10);
-const todayISO = () => new Date().toISOString().slice(0,10);
-const parseISO = s => new Date(`${s}T00:00:00`);
-function monFri(startISO,endISO){const out=[];const d=parseISO(startISO);const e=parseISO(endISO);while(d<=e){const day=d.getUTCDay();if(day===1||day===5) out.push(d.toISOString().slice(0,10));d.setUTCDate(d.getUTCDate()+1);}return out;}
-function stats(p,win){const sW=p.start_weight_kg,sWa=p.start_waist_cm;const w=p.weighIns.filter(x=>x.date>=win.startDate&&x.date<=win.endDate);const last=[...w].reverse().find(x=>x.weight_kg!=null||x.waist_cm!=null)||{};const lw=last.weight_kg??sW, lwa=last.waist_cm??sWa;const dKg=Math.max(0,sW-lw), dWa=Math.max(0,sWa-lwa);const wPct=sW?(dKg/sW)*100:0, waPct=sWa?(dWa/sWa)*100:0;const sched=monFri(win.startDate,win.endDate);const att=sched.filter(d=>p.weighIns.find(x=>x.date===d&&x.attended)).length;const attPct=sched.length?(att/sched.length)*100:0;const score=0.6*wPct+0.3*waPct+0.1*attPct;return{dKg,dWa,wPct,waPct,attPct,score,att,sched:sched.length};}
-function rank(list,win){return list.map(p=>({p,st:stats(p,win)})).sort((a,b)=>b.st.score-a.st.score).map((x,i)=>({rank:i+1,...x}));}
-export default function App(){
- const [challenge,setChallenge]=useState({startDate:todayISO(),endDate:todayISO()});
- const [participants,setParticipants]=useState([]);
- const [activeDate,setActiveDate]=useState(todayISO());
- const form=useRef({name:'',email:'',phone:'',gender:'',height_cm:'',start_weight_kg:'',start_waist_cm:''});
- const [_,bump]=useState(0);
- const schedule=useMemo(()=>monFri(challenge.startDate,challenge.endDate),[challenge]);
- const ranked=useMemo(()=>rank(participants,challenge),[participants,challenge]);
- function add(){const f=form.current;if(!f.name||!f.start_weight_kg||!f.start_waist_cm){alert('Name, Start Weight, and Start Waist are required.');return;}const p={id:uid(),name:f.name.trim(),email:f.email?.trim()||undefined,phone:f.phone?.trim()||undefined,gender:f.gender||undefined,height_cm:f.height_cm?Number(f.height_cm):undefined,start_weight_kg:Number(f.start_weight_kg),start_waist_cm:Number(f.start_waist_cm),registered_at:Date.now(),weighIns:schedule.map(d=>({date:d,attended:false}))};setParticipants(v=>[...v,p]);form.current={name:'',email:'',phone:'',gender:'',height_cm:'',start_weight_kg:'',start_waist_cm:''};bump(x=>x+1);} 
- function upd(pid,date,patch){setParticipants(v=>v.map(p=>{if(p.id!==pid)return p;const i=p.weighIns.findIndex(x=>x.date===date);const w=i===-1?{date}:p.weighIns[i];const n={...w,...patch};const arr=i===-1?[...p.weighIns,n]:p.weighIns.map((x,j)=>j===i?n:x);return {...p,weighIns:arr};}));}
- return (<div style={{padding:16,maxWidth:1100,margin:'0 auto',fontFamily:'system-ui, sans-serif'}}>
-  <h1 style={{fontSize:28,fontWeight:700}}>Candy Group App</h1>
-  <p>Register participants (phone & gender), Mon/Fri weigh-ins, leaderboard & charts.</p>
-  <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:16}}>
-    <div style={{border:'1px solid #ddd',borderRadius:12,padding:12}}>
-      <h3>Challenge Window</h3>
-      <div><label>Start </label><input type='date' value={challenge.startDate} onChange={e=>setChallenge({...challenge,startDate:e.target.value})}/></div>
-      <div><label>End </label><input type='date' value={challenge.endDate} onChange={e=>setChallenge({...challenge,endDate:e.target.value})}/></div>
-      <div>Sessions (Mon/Fri): <b>{schedule.length}</b></div>
+import React, { useEffect, useMemo, useRef, useState } from 'react'
+import { supabase } from './supabase'
+import { BrowserRouter, Routes, Route, Link, useParams, useNavigate, NavLink } from 'react-router-dom'
+
+const CHALLENGE = { startDate: '2025-10-13', endDate: '2025-12-05' } // attendance window
+
+function weekdaysBetween(startISO, endISO) {
+  const out = []
+  const d = new Date(`${startISO}T00:00:00Z`)
+  const e = new Date(`${endISO}T00:00:00Z`)
+  while (d <= e) {
+    const day = d.getUTCDay()
+    if (day >= 1 && day <= 5) out.push(d.toISOString().slice(0,10))
+    d.setUTCDate(d.getUTCDate() + 1)
+  }
+  return out
+}
+
+function useAuth() {
+  const [user, setUser] = useState(null)
+  useEffect(() => {
+    supabase.auth.getUser().then(({ data }) => setUser(data?.user || null))
+    const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => setUser(s?.user || null))
+    return () => sub.subscription.unsubscribe()
+  }, [])
+  return { user, setUser }
+}
+
+function useIsAdmin(user) {
+  const [isAdmin, setIsAdmin] = useState(false)
+  useEffect(() => {
+    (async () => {
+      const { data, error } = await supabase.rpc('is_admin')
+      setIsAdmin(!!data && !error)
+    })()
+  }, [user])
+  return isAdmin
+}
+
+function AuthBox({ user, setUser }) {
+  async function signIn(e) {
+    e.preventDefault()
+    const email = new FormData(e.currentTarget).get('email')
+    const { error } = await supabase.auth.signInWithOtp({ email })
+    if (error) alert(error.message)
+    else alert('Check your email for a sign-in link.')
+  }
+  async function signOut() { await supabase.auth.signOut(); setUser(null) }
+  return (
+    <div style={{display:'flex',gap:8,alignItems:'center'}}>
+      {user ? (<>
+        <span style={{fontSize:12, color:'#334155'}}>Signed in: {user.email}</span>
+        <button className="btn" onClick={signOut}>Sign out</button>
+      </>) : (
+        <form onSubmit={signIn} style={{display:'flex',gap:6}}>
+          <input name="email" placeholder="you@example.com" className="input" required />
+          <button className="btn">Sign in</button>
+        </form>
+      )}
     </div>
-    <div style={{border:'1px solid #ddd',borderRadius:12,padding:12}}>
-      <h3>Add Participant</h3>
-      <input placeholder='Name *' value={form.current.name} onChange={e=>{form.current.name=e.target.value;bump(x=>x+1)}}/>
-      <input placeholder='Email' value={form.current.email} onChange={e=>{form.current.email=e.target.value;bump(x=>x+1)}}/>
-      <input placeholder='Phone' value={form.current.phone} onChange={e=>{form.current.phone=e.target.value;bump(x=>x+1)}}/>
-      <select value={form.current.gender} onChange={e=>{form.current.gender=e.target.value;bump(x=>x+1)}}><option value=''>— Gender —</option><option value='male'>Male</option><option value='female'>Female</option></select>
-      <input type='number' placeholder='Height (cm)' value={form.current.height_cm} onChange={e=>{form.current.height_cm=e.target.value;bump(x=>x+1)}}/>
-      <input type='number' placeholder='Start Weight (kg) *' value={form.current.start_weight_kg} onChange={e=>{form.current.start_weight_kg=e.target.value;bump(x=>x+1)}}/>
-      <input type='number' placeholder='Start Waist (cm) *' value={form.current.start_waist_cm} onChange={e=>{form.current.start_waist_cm=e.target.value;bump(x=>x+1)}}/>
-      <button onClick={add}>Save</button>
-    </div>
-  </div>
-  <div style={{border:'1px solid #ddd',borderRadius:12,padding:12,marginTop:16}}>
-    <h3>Record Weigh-ins</h3>
-    <div><label>Date </label><input type='date' value={activeDate} onChange={e=>setActiveDate(e.target.value)}/></div>
-    <table><thead><tr><th>Name</th><th>Weight</th><th>Waist</th><th>Attended</th></tr></thead><tbody>
-    {participants.map(p=>{const w=p.weighIns.find(x=>x.date===activeDate)||{date:activeDate};return (
-      <tr key={p.id}><td>{p.name}</td>
-      <td><input type='number' value={w.weight_kg??''} onChange={e=>upd(p.id,activeDate,{weight_kg:e.target.value?Number(e.target.value):undefined})}/></td>
-      <td><input type='number' value={w.waist_cm??''} onChange={e=>upd(p.id,activeDate,{waist_cm:e.target.value?Number(e.target.value):undefined})}/></td>
-      <td><input type='checkbox' checked={!!w.attended} onChange={e=>upd(p.id,activeDate,{attended:e.target.checked})}/></td></tr>
-    );})}
-    </tbody></table>
-  </div>
-  <div style={{border:'1px solid #ddd',borderRadius:12,padding:12,marginTop:16}}>
-    <h3>Leaderboard</h3>
-    <table><thead><tr><th>#</th><th>Name</th><th>Score</th><th>Weight Δ</th><th>Waist Δ</th><th>Attendance</th></tr></thead><tbody>
-      {ranked.map(({rank,p,st})=> (
-        <tr key={p.id}><td>{rank}</td><td>{p.name}</td><td>{st.score.toFixed(2)}</td><td>-{st.dKg.toFixed(2)} kg ({st.wPct.toFixed(1)}%)</td><td>-{st.dWa.toFixed(1)} cm ({st.waPct.toFixed(1)}%)</td><td>{st.attPct.toFixed(0)}% ({st.att}/{st.sched})</td></tr>
+  )
+}
+
+function Header({ user, setUser }) {
+  return (
+    <header>
+      <div className="inner">
+        <div style={{display:'flex',alignItems:'center',gap:10}}>
+          <img src="/logo.jpg" alt="Candy Group" style={{height:40, borderRadius:8}}/>
+          <div style={{fontWeight:800, fontSize:18}}>Candy Group App</div>
+        </div>
+        <nav style={{display:'flex',gap:6}}>
+          <NavLink to="/participants" className={({isActive})=> isActive? 'active' : undefined }>Participants</NavLink>
+          <NavLink to="/attendance" className={({isActive})=> isActive? 'active' : undefined }>Attendance</NavLink>
+        </nav>
+        <AuthBox user={user} setUser={setUser} />
+      </div>
+    </header>
+  )
+}
+
+function PhotoGrid({ participantId }) {
+  const [photos, setPhotos] = useState([])
+  useEffect(() => {
+    (async () => {
+      const { data } = await supabase
+        .from('photos').select('*')
+        .eq('participant_id', participantId)
+        .order('inserted_at', { ascending: false })
+      setPhotos(data || [])
+    })()
+  }, [participantId])
+  return (
+    <div className="grid" style={{gridTemplateColumns:'repeat(3,minmax(0,1fr))'}}>
+      {photos.map(ph => (
+        <a key={ph.id} href={ph.public_url} target="_blank" rel="noreferrer">
+          <img src={ph.public_url} alt="" style={{width:'100%',height:96,objectFit:'cover',borderRadius:10}}/>
+        </a>
       ))}
-    </tbody></table>
-    <div style={{height:260}}>
-      <ResponsiveContainer width='100%' height='100%'>
-        <BarChart data={[...ranked].slice(0,10).map(x=>({name:x.p.name,value:Number(x.st.wPct.toFixed(2))}))}>
-          <XAxis dataKey='name' hide/>
-          <YAxis/>
-          <Tooltip formatter={v=>`${v}%`}/>
-          <Bar dataKey='value'/>
-        </BarChart>
-      </ResponsiveContainer>
+      {photos.length===0 && <div style={{color:'#64748b', fontSize:12}}>No photos yet.</div>}
     </div>
-  </div>
- </div>);
+  )
+}
+
+function ParticipantsPage({ participants, isAdmin, onUploadPhoto, onAddWeighIn, onGoEdit }) {
+  const [wDate, setWDate] = useState(() => new Date().toISOString().slice(0,10))
+  const [wWeight, setWWeight] = useState('')
+  const [wWaist, setWWaist] = useState('')
+  return (
+    <div className="container">
+      <div className="card" style={{padding:16, marginBottom:12}}>
+        <div style={{fontWeight:700, marginBottom:8}}>Participants</div>
+        <div className="grid">
+          {participants.map(p => (
+            <div key={p.id} className="card" style={{padding:12}}>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
+                <div>
+                  <div style={{fontWeight:700}}>{p.name}</div>
+                  <div style={{fontSize:12, color:'#475569'}}>{p.gender || '—'} • {p.phone || '—'}</div>
+                </div>
+                {isAdmin && <button className="btn" onClick={()=>onGoEdit(p.id)}>Edit</button>}
+              </div>
+
+              <div style={{fontSize:13, color:'#334155', marginBottom:6}}>Transformation photos</div>
+              <input type="file" accept="image/*" capture="environment" onChange={e => onUploadPhoto(p.id, e.target.files?.[0])} />
+              <div style={{height:8}}/>
+              <PhotoGrid participantId={p.id} />
+
+              <div style={{height:10}}/>
+              <div style={{fontSize:13, color:'#334155', margin:'8px 0 4px'}}>Weigh-ins (read only)</div>
+              <table>
+                <thead><tr><th>Date</th><th>Weight (kg)</th><th>Waist (cm)</th><th>Attended</th></tr></thead>
+                <tbody>
+                  {(p.weighIns||[]).sort((a,b)=>a.date.localeCompare(b.date)).map((w,i)=>(
+                    <tr key={i}>
+                      <td>{w.date}</td>
+                      <td><input readOnly className="input" value={w.weight_kg ?? ''} /></td>
+                      <td><input readOnly className="input" value={w.waist_cm ?? ''} /></td>
+                      <td><input type="checkbox" disabled checked={!!w.attended} /></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+
+              {isAdmin && (
+                <div style={{marginTop:8}}>
+                  <div style={{fontSize:12, color:'#64748b', marginBottom:4}}>Add weigh-in (admin only)</div>
+                  <div style={{display:'grid',gridTemplateColumns:'140px 1fr 1fr 120px',gap:8}}>
+                    <input type="date" className="input" value={wDate} onChange={e=>setWDate(e.target.value)} />
+                    <input className="input" placeholder="Weight kg" value={wWeight} onChange={e=>setWWeight(e.target.value)} />
+                    <input className="input" placeholder="Waist cm" value={wWaist} onChange={e=>setWWaist(e.target.value)} />
+                    <button className="btn" onClick={()=>onAddWeighIn(p.id, wDate, parseFloat(wWeight||'0')||null, parseFloat(wWaist||'0')||null)}>Save</button>
+                  </div>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function AttendanceSheet({ participants, isAdmin }) {
+  const weekdays = useMemo(()=>weekdaysBetween(CHALLENGE.startDate, CHALLENGE.endDate),[])
+  const [date, setDate] = useState(weekdays[0] || new Date().toISOString().slice(0,10))
+
+  return (
+    <div className="container">
+      <div className="card" style={{padding:16}}>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+          <div style={{fontWeight:700}}>Weekday Attendance</div>
+          <div style={{display:'flex', gap:8, alignItems:'center'}}>
+            <span style={{fontSize:12, color:'#475569'}}>Window: {CHALLENGE.startDate} → {CHALLENGE.endDate} ({weekdays.length} weekdays)</span>
+            <input type="date" className="input" style={{width:180}} value={date} onChange={e=>setDate(e.target.value)} />
+          </div>
+        </div>
+        <div style={{height:8}}/>
+        <table>
+          <thead><tr><th>Name</th><th>Present</th></tr></thead>
+          <tbody>
+            {participants.map(p => {
+              const present = p.attendanceDates?.has(date)
+              return (
+                <tr key={p.id}>
+                  <td>{p.name}</td>
+                  <td>
+                    <input type="checkbox" checked={!!present} disabled={!isAdmin}
+                      onChange={e=>markAttendance(p.id, date, e.target.checked)} />
+                  </td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+
+  async function markAttendance(pid, date, present) {
+    if (!isAdmin) { alert('Admins only'); return }
+    if (present) {
+      const { error } = await supabase.from('daily_attendance').insert({ participant_id: pid, date, present: true })
+      if (error && error.code !== '23505') { alert(error.message); return }
+    } else {
+      const { error } = await supabase.from('daily_attendance').delete().eq('participant_id', pid).eq('date', date)
+      if (error) { alert(error.message); return }
+    }
+    window.dispatchEvent(new Event('reload-data'))
+  }
+}
+
+function AdminEditParticipant({ participants, onSave }) {
+  const { id } = useParams()
+  const nav = useNavigate()
+  const p = participants.find(x => String(x.id) === String(id))
+  const [form, setForm] = useState(p || {})
+  if (!p) return <div className="container"><div className="card" style={{padding:16}}>Not found</div></div>
+  async function save() { await onSave(form); nav('/participants') }
+  return (
+    <div className="container">
+      <div className="card" style={{padding:16, maxWidth:560, margin:'0 auto'}}>
+        <div style={{fontWeight:700, marginBottom:8}}>Edit: {p.name}</div>
+        <input className="input" value={form.name||''} onChange={e=>setForm({...form,name:e.target.value})} placeholder="Name"/>
+        <input className="input" value={form.email||''} onChange={e=>setForm({...form,email:e.target.value})} placeholder="Email"/>
+        <input className="input" value={form.phone||''} onChange={e=>setForm({...form,phone:e.target.value})} placeholder="Phone"/>
+        <select className="input" value={form.gender||''} onChange={e=>setForm({...form,gender:e.target.value})}>
+          <option value="">— Gender —</option>
+          <option value="male">Male</option>
+          <option value="female">Female</option>
+        </select>
+        <input className="input" type="number" value={form.height_cm||''} onChange={e=>setForm({...form,height_cm:e.target.value})} placeholder="Height (cm)"/>
+        <div style={{display:'flex',justifyContent:'flex-end'}}><button className="btn" onClick={save}>Save</button></div>
+      </div>
+    </div>
+  )
+}
+
+export default function App(){
+  const { user, setUser } = useAuth()
+  const isAdmin = useIsAdmin(user)
+  const [participants, setParticipants] = useState([])
+
+  useEffect(() => {
+    const handler = () => loadAll()
+    window.addEventListener('reload-data', handler)
+    loadAll()
+    return () => window.removeEventListener('reload-data', handler)
+  }, [])
+
+  async function loadAll(){
+    const { data: pRows } = await supabase.from('participants').select('*').order('registered_at', { ascending: true })
+    const { data: wRows } = await supabase.from('weigh_ins').select('*')
+    const { data: aRows } = await supabase.from('daily_attendance').select('*')
+
+    const map = new Map()
+    for (const p of (pRows||[])) map.set(p.id, { ...p, weighIns: [] })
+    for (const w of (wRows||[])) {
+      const p = map.get(w.participant_id)
+      if (p) p.weighIns.push({ date: w.date, weight_kg: w.weight_kg ?? undefined, waist_cm: w.waist_cm ?? undefined, attended: !!w.attended })
+    }
+    const attByPid = new Map()
+    for (const a of (aRows||[])) {
+      if (!attByPid.has(a.participant_id)) attByPid.set(a.participant_id, new Set())
+      if (a.present) attByPid.get(a.participant_id).add(a.date)
+    }
+    const list = Array.from(map.values()).map(p => ({ ...p, attendanceDates: attByPid.get(p.id) || new Set() }))
+    setParticipants(list)
+  }
+
+  async function onUploadPhoto(participantId, file) {
+    if (!user) { alert('Please sign in first.'); return }
+    if (!file) return
+    const safeName = file.name.replace(/\s+/g,'_')
+    const path = `participants/${participantId}/${Date.now()}_${safeName}`
+    const { error: upErr } = await supabase.storage.from('photos').upload(path, file, { cacheControl: '3600', upsert: false })
+    if (upErr) { alert(upErr.message); return }
+    const { data: pub } = await supabase.storage.from('photos').getPublicUrl(path)
+    await supabase.from('photos').insert({ participant_id: participantId, storage_path: path, public_url: pub.publicUrl })
+    loadAll()
+  }
+
+  async function onAddWeighIn(pid, date, weight_kg, waist_cm) {
+    if (!isAdmin) { alert('Admins only'); return }
+    const { error } = await supabase.from('weigh_ins').insert({ participant_id: pid, date, weight_kg, waist_cm, attended: true })
+    if (error) { alert(error.message); return }
+    loadAll()
+  }
+
+  async function adminSaveParticipant(f) {
+    if (!isAdmin) { alert('Admins only'); return }
+    const { error } = await supabase.from('participants').update({
+      name: f.name, email: f.email, phone: f.phone, gender: f.gender, height_cm: f.height_cm
+    }).eq('id', f.id)
+    if (error) alert(error.message); else loadAll()
+  }
+
+  function onGoEdit(id){ window.location.href = `/admin/${id}` }
+
+  return (
+    <BrowserRouter>
+      <Header user={user} setUser={setUser} />
+      <Routes>
+        <Route path="/participants" element={
+          <ParticipantsPage
+            participants={participants}
+            isAdmin={isAdmin}
+            onUploadPhoto={onUploadPhoto}
+            onAddWeighIn={onAddWeighIn}
+            onGoEdit={onGoEdit}
+          />
+        } />
+        <Route path="/attendance" element={<AttendanceSheet participants={participants} isAdmin={isAdmin} />} />
+        <Route path="/admin/:id" element={
+          isAdmin ? <AdminEditParticipant participants={participants} onSave={adminSaveParticipant}/> : <div className="container"><div className="card" style={{padding:16}}>Admins only</div></div>
+        } />
+        <Route path="*" element={<div className="container"><div className="card" style={{padding:16}}>Go to <Link to="/participants">Participants</Link></div></div>} />
+      </Routes>
+    </BrowserRouter>
+  )
 }
